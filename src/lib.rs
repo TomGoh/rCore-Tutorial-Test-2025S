@@ -29,7 +29,8 @@ static HEAP: LockedHeap = LockedHeap::empty();
 pub fn handle_alloc_error(layout: core::alloc::Layout) -> ! {
     panic!("Heap allocation error, layout = {:?}", layout);
 }
-
+/// Clear the BSS section, should be called before setting up the user library in the
+/// user lib entry function `_start`
 fn clear_bss() {
     extern "C" {
         fn start_bss();
@@ -44,21 +45,50 @@ fn clear_bss() {
     }
 }
 
+/// Entry function of the user library, which placed in the `.text.entry` text segment
+///
+/// EXECUTION FLOW:
+/// 1. Kernel (running at 0x80200000) loads user program into virtual address space starting at 0x0
+/// 2. Kernel sets up user process context and jumps to user program's `_start` (this function)
+/// 3. This function performs user-space runtime initialization before calling user's main()
+/// 4. Different from kernel's `_start` at 0x80200000 - this is user program's entry point at 0x0
+///
+/// USER LINKER INTEGRATION (user/src/linker.ld):
+/// - BASE_ADDRESS = 0x0 - user programs start at virtual address 0x0
+/// - ENTRY(_start) - sets this as user program entry point
+/// 
+/// - *(.text.entry) - places this section first in user .text at address 0x0
+/// - #[no_mangle] - preserves symbol name for user linker to find
+/// - extern "C" - uses C calling convention expected by kernel when launching user programs
+/// 
+/// Params:
+/// - `argc`: number of command line arguments
+/// - `argv`: pointer to array of command line argument strings
 #[no_mangle]
 #[link_section = ".text.entry"]
 pub extern "C" fn _start(argc: usize, argv: usize) -> ! {
+    // Clear uninitialized global variables (BSS segment)
     clear_bss();
+
+    // Initialize heap allocator so we can use Vec and other dynamic data structures
     unsafe {
         HEAP.lock()
             .init(HEAP_SPACE.as_ptr() as usize, USER_HEAP_SIZE);
     }
+
+    // Parse command line arguments from C-style argc/argv to Rust Vec<&str>
     let mut v: Vec<&'static str> = Vec::new();
     for i in 0..argc {
+        // argv is pointer to array of string pointers - get i-th string pointer
         let str_start =
             unsafe { ((argv + i * core::mem::size_of::<usize>()) as *const usize).read_volatile() };
+
+        // Find length by searching for null terminator in C-style string
         let len = (0usize..)
             .find(|i| unsafe { ((str_start + *i) as *const u8).read_volatile() == 0 })
             .unwrap();
+
+        // Convert raw pointer + length to Rust string slice and add to vector
         v.push(
             core::str::from_utf8(unsafe {
                 core::slice::from_raw_parts(str_start as *const u8, len)
@@ -66,9 +96,14 @@ pub extern "C" fn _start(argc: usize, argv: usize) -> ! {
             .unwrap(),
         );
     }
+
+    // Call user's main function with parsed arguments, then exit with its return value
     exit(main(argc, v.as_slice()));
 }
 
+/// A weak linked main function.
+/// Only linked into the program when the compiler failed to find and link each main function
+/// under the src/bin directory of each file 
 #[linkage = "weak"]
 #[no_mangle]
 fn main(_argc: usize, _argv: &[&str]) -> i32 {
